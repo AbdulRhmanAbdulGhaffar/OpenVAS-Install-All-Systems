@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenVAS / Greenbone CE — Universal Installer (FINAL, COMPLETE)
+# OpenVAS / Greenbone CE — Universal Installer (FINAL)
 # One-command install, idempotent, overwrite/reinstall, Debian pip conflict fix
 # GSSAPI fix (libkrb5-dev/krb5-devel), GSA rsync, systemd hardening, logging
 # Repo: https://github.com/AbdulRhmanAbdulGhaffar/OpenVAS-Install-All-Systems
@@ -30,12 +30,11 @@ OPENVAS_SCANNER_VERSION="${OPENVAS_SCANNER_VERSION:-23.20.1}"
 OSPD_OPENVAS_VERSION="${OSPD_OPENVAS_VERSION:-22.9.0}"
 OPENVAS_DAEMON="${OPENVAS_DAEMON:-23.20.0}"
 
-# Directories (fix any unbound issues)
+# Directories (avoid unbound)
 SOURCE_DIR="${SOURCE_DIR:-$HOME/source}"
 BUILD_DIR="${BUILD_DIR:-$HOME/build}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/install}"
 SRC="${SRC:-$SOURCE_DIR}"
-
 mkdir -p "$SOURCE_DIR" "$BUILD_DIR" "$INSTALL_DIR"
 
 # ---------------- Utils ----------------
@@ -47,7 +46,6 @@ log(){ printf "\033[1;32m[+] \033[0m%s\n" "$*"; }
 wrn(){ printf "\033[1;33m[!] \033[0m%s\n" "$*"; }
 err(){ printf "\033[1;31m[x] \033[0m%s\n" "$*"; } >&2
 run(){ if (( VERBOSE )); then set -x; fi; "$@"; if (( VERBOSE )); then set +x; fi; }
-need(){ command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
 maybe_sudo(){ if (( NO_SUDO )); then "$@"; else sudo "$@"; fi; }
 component_should_rebuild(){ [[ "$REINSTALL" == "all" || "$REINSTALL" == "$1" ]]; }
 
@@ -77,6 +75,7 @@ safe_install(){
   [[ -n "$own" ]] && maybe_sudo chown "$own" "$d"
 }
 
+# ---- Fixed extractor: handles nested top-level directory names from tarballs
 extract_clean(){
   # extract_clean <tar.gz> <target_dir>
   local tarfile="$1" target="$2"
@@ -88,14 +87,26 @@ extract_clean(){
              rm -rf "$target";;
     esac
   fi
-  mkdir -p "$target"
-  tar -C "$target" -xzf "$tarfile"
+  local topdir
+  topdir="$(tar -tzf "$tarfile" | head -1 | cut -d/ -f1)"
+  tar -C "$SOURCE_DIR" -xzf "$tarfile"
+  mkdir -p "$(dirname "$target")"
+  # انقل المجلد الداخلي للمسار المطلوب (بدون طبقة إضافية)
+  mv -T "$SOURCE_DIR/$topdir" "$target"
 }
 
-fetch(){
-  curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 "$1" -o "$2"
+# ترجع مجلد السورس اللي فيه CMakeLists.txt لو الاسم اختلف
+real_src(){
+  # real_src <dir-expected>
+  local base="$1"
+  if [[ -f "$base/CMakeLists.txt" ]]; then
+    printf "%s\n" "$base"
+  else
+    find "$base" -maxdepth 2 -type f -name CMakeLists.txt -printf '%h\n' -quit
+  fi
 }
 
+fetch(){ curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 "$1" -o "$2"; }
 fetch_and_verify(){
   # fetch_and_verify <url_tar> <url_asc> <out_tar>
   local url="$1" sig="$2" tar="$3" asc="${3}.asc"
@@ -114,13 +125,13 @@ fetch_and_verify(){
 usage(){ cat <<EOF
 Usage: $0 [OPTIONS]
   --os <id>            ubuntu|debian|kali|fedora|rhel|rocky|alma|centos|arch|macos|generic
-  --use-docker         Use official Docker images (macOS-friendly)
+  --use-docker         Use official Docker images
   --port <num>         GSA port (default 9392)
   --no-postgres        Skip local PostgreSQL
   --skip-feed-sync     Don't run initial feed sync
-  --overwrite <ask|skip|force>  Overwrite policy (default ask)
+  --overwrite <ask|skip|force>  Overwrite policy
   --reinstall <target|all>      Rebuild specific component
-  --yes|-y             Non-interactive (assume yes)
+  --yes|-y             Non-interactive
   --verbose            Verbose output
   --uninstall          Remove all services/files
   -h|--help            Show help
@@ -169,7 +180,7 @@ fi
 
 # ---------------- Docker path ----------------
 if [[ "$OS_ID" == "macos" || "$USE_DOCKER" -eq 1 ]]; then
-  need docker
+  command -v docker >/dev/null 2>&1 || { err "Docker required"; exit 1; }
   log "Deploying Docker stack."
   mkdir -p docker
   cat > docker/docker-compose.yml <<YAML
@@ -245,7 +256,7 @@ fetch_and_verify \
   "https://github.com/greenbone/gvm-libs/archive/refs/tags/v$GVM_LIBS_VERSION.tar.gz" \
   "https://github.com/greenbone/gvm-libs/releases/download/v$GVM_LIBS_VERSION/gvm-libs-$GVM_LIBS_VERSION.tar.gz.asc" \
   "$T"
-SRC_DIR="$SOURCE_DIR/gvm-libs-$GVM_LIBS_VERSION"; extract_clean "$T" "$SRC_DIR"
+SRC_DIR="$SOURCE_DIR/gvm-libs-$GVM_LIBS_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
 BLD_LIBS="$BUILD_DIR/gvm-libs"; [[ -d "$BLD_LIBS" && $(component_should_rebuild gvm-libs) ]] && rm -rf "$BLD_LIBS"
 cmake -S "$SRC_DIR" -B "$BLD_LIBS" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var
 cmake --build "$BLD_LIBS" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvm-libs" && cd "$BLD_LIBS"
@@ -261,7 +272,7 @@ fetch_and_verify \
   "https://github.com/greenbone/gvmd/archive/refs/tags/v$GVMD_VERSION.tar.gz" \
   "https://github.com/greenbone/gvmd/releases/download/v$GVMD_VERSION/gvmd-$GVMD_VERSION.tar.gz.asc" \
   "$T"
-SRC_DIR="$SOURCE_DIR/gvmd-$GVMD_VERSION"; extract_clean "$T" "$SRC_DIR"
+SRC_DIR="$SOURCE_DIR/gvmd-$GVMD_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
 BLD_GVMD="$BUILD_DIR/gvmd"; [[ -d "$BLD_GVMD" && $(component_should_rebuild gvmd) ]] && rm -rf "$BLD_GVMD"
 cmake -S "$SRC_DIR" -B "$BLD_GVMD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DLOCALSTATEDIR=/var -DSYSCONFDIR=/etc -DGVM_DATA_DIR=/var -DGVM_LOG_DIR=/var/log/gvm \
@@ -278,7 +289,7 @@ fetch_and_verify \
   "https://github.com/greenbone/pg-gvm/archive/refs/tags/v$PG_GVM_VERSION.tar.gz" \
   "https://github.com/greenbone/pg-gvm/releases/download/v$PG_GVM_VERSION/pg-gvm-$PG_GVM_VERSION.tar.gz.asc" \
   "$T"
-SRC_DIR="$SOURCE_DIR/pg-gvm-$PG_GVM_VERSION"; extract_clean "$T" "$SRC_DIR"
+SRC_DIR="$SOURCE_DIR/pg-gvm-$PG_GVM_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
 BLD_PG="$BUILD_DIR/pg-gvm"; [[ -d "$BLD_PG" && $(component_should_rebuild pg-gvm) ]] && rm -rf "$BLD_PG"
 cmake -S "$SRC_DIR" -B "$BLD_PG" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BLD_PG" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/pg-gvm" && cd "$BLD_PG"
@@ -303,7 +314,7 @@ fetch_and_verify \
   "https://github.com/greenbone/gsad/archive/refs/tags/v$GSAD_VERSION.tar.gz" \
   "https://github.com/greenbone/gsad/releases/download/v$GSAD_VERSION/gsad-$GSAD_VERSION.tar.gz.asc" \
   "$T"
-SRC_DIR="$SOURCE_DIR/gsad-$GSAD_VERSION"; extract_clean "$T" "$SRC_DIR"
+SRC_DIR="$SOURCE_DIR/gsad-$GSAD_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
 BLD_GSAD="$BUILD_DIR/gsad"; [[ -d "$BLD_GSAD" && $(component_should_rebuild gsad) ]] && rm -rf "$BLD_GSAD"
 cmake -S "$SRC_DIR" -B "$BLD_GSAD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DGVMD_RUN_DIR=/run/gvmd -DGSAD_RUN_DIR=/run/gsad \
@@ -321,7 +332,7 @@ fetch_and_verify \
   "https://github.com/greenbone/openvas-smb/archive/refs/tags/v$OPENVAS_SMB_VERSION.tar.gz" \
   "https://github.com/greenbone/openvas-smb/releases/download/v$OPENVAS_SMB_VERSION/openvas-smb-v$OPENVAS_SMB_VERSION.tar.gz.asc" \
   "$T"
-SRC_DIR="$SOURCE_DIR/openvas-smb-$OPENVAS_SMB_VERSION"; extract_clean "$T" "$SRC_DIR"
+SRC_DIR="$SOURCE_DIR/openvas-smb-$OPENVAS_SMB_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
 BLD_SMB="$BUILD_DIR/openvas-smb"; [[ -d "$BLD_SMB" && $(component_should_rebuild smb) ]] && rm -rf "$BLD_SMB"
 cmake -S "$SRC_DIR" -B "$BLD_SMB" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BLD_SMB" -j"$(nproc)" || wrn "openvas-smb build issue (optional)"
@@ -346,7 +357,7 @@ fetch_and_verify \
   "https://github.com/greenbone/openvas-scanner/archive/refs/tags/v$OPENVAS_SCANNER_VERSION.tar.gz" \
   "https://github.com/greenbone/openvas-scanner/releases/download/v$OPENVAS_SCANNER_VERSION/openvas-scanner-v$OPENVAS_SCANNER_VERSION.tar.gz.asc" \
   "$T"
-SRC_DIR="$SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION"; extract_clean "$T" "$SRC_DIR"
+SRC_DIR="$SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
 BLD_SCANNER="$BUILD_DIR/openvas-scanner"; [[ -d "$BLD_SCANNER" && $(component_should_rebuild scanner) ]] && rm -rf "$BLD_SCANNER"
 cmake -S "$SRC_DIR" -B "$BLD_SCANNER" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DOPENVAS_FEED_LOCK_PATH=/var/lib/openvas/feed-update.lock \
@@ -359,7 +370,7 @@ echo "openvasd_server = http://127.0.0.1:3000" | maybe_sudo tee -a /etc/openvas/
 
 # ---------------- ospd-openvas (pip vs Debian fix) ----------------
 log "Install ospd-openvas $OSPD_OPENVAS_VERSION (pip over Debian fix)"
-# Remove Debian/RPM package if present to avoid uninstall error
+# Remove Debian/RPM package if present to avoid pip uninstall error
 if command -v dpkg >/dev/null 2>&1 && dpkg -s python3-ospd-openvas >/dev/null 2>&1; then
   wrn "Removing Debian package python3-ospd-openvas"
   sudo apt remove -y python3-ospd-openvas || true
