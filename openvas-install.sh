@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenVAS / Greenbone Community Edition — Cross‑Platform Installer (Full Source)
+# OpenVAS / Greenbone Community Edition — Cross-Platform Installer (Full Source)
 # Repository: https://github.com/AbdulRhmanAbdulGhaffar/OpenVAS-Install-All-Systems
 # Author: AbdulRhman AbdulGhaffar
 # License: MIT
@@ -259,7 +259,7 @@ run mkdir -p "$INSTALL_DIR/pg-gvm" && cd "$BUILD_DIR/pg-gvm"
 run make DESTDIR="$INSTALL_DIR/pg-gvm" install
 maybe_sudo cp -rv "$INSTALL_DIR/pg-gvm"/* /
 
-# GSA (dist)
+# ---------------------- FIXED: GSA (dist) ----------------------
 log "Installing GSA dist $GSA_VERSION"
 tarball="$SOURCE_DIR/gsa-$GSA_VERSION.tar.gz"
 fetch_and_verify \
@@ -267,9 +267,10 @@ fetch_and_verify \
   "https://github.com/greenbone/gsa/releases/download/v$GSA_VERSION/gsa-dist-$GSA_VERSION.tar.gz.asc" \
   "$tarball"
 mkdir -p "$SOURCE_DIR/gsa-$GSA_VERSION"
-extract "$tarball" || true
+tar -C "$SOURCE_DIR/gsa-$GSA_VERSION" -xvzf "$tarball"
 maybe_sudo mkdir -p "$INSTALL_PREFIX/share/gvm/gsad/web/"
 maybe_sudo cp -rv "$SOURCE_DIR/gsa-$GSA_VERSION"/* "$INSTALL_PREFIX/share/gvm/gsad/web/"
+# --------------------------------------------------------------
 
 # gsad
 log "Building gsad $GSAD_VERSION"
