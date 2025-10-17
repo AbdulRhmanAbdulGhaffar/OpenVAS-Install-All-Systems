@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenVAS / Greenbone CE — Universal Installer (FINAL ALL-IN-ONE)
-# - Fix GitHub tarball nested dir (strip-components=1)
-# - Fix Debian pip conflict for ospd-openvas
-# - Install libkrb5-dev/krb5-devel (gssapi.h)
-# - Overwrite policy & reuse-sources
-# - Logging + systemd units + feed sync
+# OpenVAS / Greenbone CE — Universal Installer (FINAL)
+# - Fix GitHub tarball nesting (strip-components=1)
+# - Overwrite policy + reuse-sources
+# - Debian/RPM conflict fix for ospd-openvas (pip vs distro)
+# - gssapi.h fix (libkrb5-dev / krb5-devel)
+# - Rust build hardening for openvasd (CARGO_TARGET_DIR + deps dir)
+# - systemd units, Redis, Postgres, feed sync, admin user
 # ==============================================================================
 
 set -euo pipefail
@@ -14,9 +15,9 @@ IFS=$'\n\t'
 # ---------------- Defaults ----------------
 OS_ID=""; USE_DOCKER=0; IS_WSL=0; PORT=9392; WITH_POSTGRES=1; NO_SUDO=0
 SKIP_FEED=0; NONINTERACTIVE=0; VERBOSE=0; UNINSTALL=0
-OVERWRITE_MODE="ask"         # ask|skip|force
-REUSE_SOURCES=0              # 0/1  -> --reuse-sources لتخطي فك الأرشيف لو موجود
-REINSTALL="none"             # none|all|gvm-libs|gvmd|pg-gvm|gsa|gsad|smb|scanner|ospd|openvasd
+OVERWRITE_MODE="ask"     # ask|skip|force
+REUSE_SOURCES=0          # 0/1 -> --reuse-sources
+REINSTALL="none"         # none|all|gvm-libs|gvmd|pg-gvm|gsa|gsad|smb|scanner|ospd|openvasd
 
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 GVM_ADMIN_USER="${GVM_ADMIN_USER:-admin}"
@@ -48,21 +49,20 @@ wrn(){ printf "\033[1;33m[!] \033[0m%s\n" "$*"; }
 err(){ printf "\033[1;31m[x] \033[0m%s\n" "$*"; } >&2
 run(){ if (( VERBOSE )); then set -x; fi; "$@"; if (( VERBOSE )); then set +x; fi; }
 maybe_sudo(){ if (( NO_SUDO )); then "$@"; else sudo "$@"; fi; }
-component_should_rebuild(){ [[ "$REINSTALL" == "all" || "$REINSTALL" == "$1" ]]; }
 
 usage(){ cat <<EOF
 Usage: $0 [OPTIONS]
   --os <id>            ubuntu|debian|kali|fedora|rhel|rocky|alma|centos|arch|macos|generic
-  --use-docker         Use official Docker images
+  --use-docker         Use official Docker images instead of native build
   --port <num>         GSA port (default 9392)
   --no-postgres        Skip local PostgreSQL
   --skip-feed-sync     Don't run initial feed sync
   --overwrite <ask|skip|force>  Overwrite policy (default ask)
   --reuse-sources      Reuse existing sources (skip extracting tarballs)
-  --reinstall <target|all>      Rebuild specific component
-  --yes|-y             Non-interactive
+  --reinstall <target|all>      Force rebuild a component
+  --yes|-y             Non-interactive mode
   --verbose            Verbose output
-  --uninstall          Remove all services/files
+  --uninstall          Remove all services and data
   -h|--help            Show help
 EOF
 }
@@ -84,53 +84,31 @@ while (( $# )); do case "$1" in
   *) err "Unknown option: $1"; usage; exit 2;;
 esac; shift; done
 
-# ---------------- Helper funcs ----------------
 ask_overwrite(){
   local path="$1"
   case "$OVERWRITE_MODE" in
     force) return 0;;
     skip)  return 1;;
-    ask)
-      if (( NONINTERACTIVE )); then return 0; fi
-      read -rp "[?] '$path' exists. overwrite? [y/N] " ans
-      [[ "${ans,,}" == "y" ]]
-      ;;
+    ask)   if (( NONINTERACTIVE )); then return 0; fi
+           read -rp "[?] '$path' exists. overwrite? [y/N] " ans
+           [[ "${ans,,}" == "y" ]];;
   esac
 }
 
-safe_install(){
-  # safe_install <src> <dest> [mode] [owner:group]
-  local s="$1" d="$2" mode="${3:-}" own="${4:-}"
-  if [[ -e "$d" ]]; then
-    if ! ask_overwrite "$d"; then wrn "SKIP: $d"; return 0; fi
-    local bak="${d}.bak.$(date +%Y%m%d-%H%M%S)"
-    wrn "Backup: $d -> $bak"
-    maybe_sudo mv -f "$d" "$bak"
-  fi
-  maybe_sudo install -D ${mode:+-m "$mode"} "$s" "$d"
-  [[ -n "$own" ]] && maybe_sudo chown "$own" "$d"
-}
-
 fetch(){ curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 "$1" -o "$2"; }
-fetch_and_verify(){
-  # fetch_and_verify <url_tar> <url_asc> <out_tar>
+fetch_and_verify(){ # <url_tar> <url_sig> <out_tar>
   local url="$1" sig="$2" tar="$3" asc="${3}.asc"
   if ! (( REUSE_SOURCES )) || [[ ! -f "$tar" ]]; then
     fetch "$url" "$tar"; fetch "$sig" "$asc"
-  else
-    wrn "Using existing tar: $tar"
-  fi
+  else wrn "Using existing tar: $tar"; fi
   gpg --verify "$asc" "$tar"
 }
 
-# ---------- UNIVERSAL TAR EXTRACT (fix nested top dir) ----------
-extract_clean(){
-  # extract_clean <tar.gz> <target_dir>
+# ---- Extract tarballs with removing top dir (fix nested) ----
+extract_clean(){ # <tar.gz> <target_dir>
   local tarfile="$1" target="$2"
   if (( REUSE_SOURCES )) && [[ -d "$target" ]]; then
-    wrn "REUSE_SOURCES=1 -> using existing: $target"
-    return 0
-  fi
+    wrn "REUSE_SOURCES=1 -> using existing: $target"; return 0; fi
   if [[ -d "$target" ]]; then
     case "$OVERWRITE_MODE" in
       force) rm -rf "$target";;
@@ -143,34 +121,28 @@ extract_clean(){
   tar -C "$target" --strip-components=1 -xzf "$tarfile"
 }
 
-# لو لأي سبب مش لاقي CMakeLists، دوّر تلقائيًا
-ensure_cmake_src(){
+ensure_cmake_src(){ # <base_dir>
   local base="$1"
-  if [[ -f "$base/CMakeLists.txt" ]]; then printf "%s\n" "$base"; return 0; fi
+  [[ -f "$base/CMakeLists.txt" ]] && { printf "%s\n" "$base"; return 0; }
   local found; found="$(find "$base" -maxdepth 3 -type f -name CMakeLists.txt -printf '%h\n' -quit || true)"
   [[ -n "$found" ]] && printf "%s\n" "$found" || { err "CMakeLists.txt not found under $base"; return 1; }
 }
 
-# دالة موحّدة لبناء أي كومبوننت CMake
-build_cmake_component(){
-  # build_cmake_component <name> <version> <url_tar> <url_sig> <cmake-args...>
+build_cmake_component(){ # <name> <version> <url_tar> <url_sig> <cmake-args...>
   local NAME="$1" VER="$2" URL="$3" SIG="$4"; shift 4
   local TAR="$SOURCE_DIR/${NAME}-${VER}.tar.gz"
   local SRC_DIR="$SOURCE_DIR/${NAME}-${VER}"
   local BLD_DIR="$BUILD_DIR/${NAME}"
   local INS_DIR="$INSTALL_DIR/${NAME}"
-
   fetch_and_verify "$URL" "$SIG" "$TAR"
   extract_clean "$TAR" "$SRC_DIR"
   SRC_DIR="$(ensure_cmake_src "$SRC_DIR")"
-
   [[ -d "$BLD_DIR" ]] && rm -rf "$BLD_DIR"
   cmake -S "$SRC_DIR" -B "$BLD_DIR" "$@"
   cmake --build "$BLD_DIR" -j"$(nproc)"
-
   mkdir -p "$INS_DIR" && cd "$BLD_DIR"
   make DESTDIR="$INS_DIR" install
-  maybe_sudo cp -rv "$INS_DIR"/* /
+  if (( NO_SUDO )); then cp -rv "$INS_DIR"/* /; else sudo cp -rv "$INS_DIR"/* /; fi
 }
 
 # ---------------- Detect OS ----------------
@@ -183,7 +155,7 @@ fi
 
 # ---------------- Uninstall ----------------
 if (( UNINSTALL )); then
-  wrn "Uninstalling OpenVAS (remove services & data)."
+  wrn "Uninstalling OpenVAS (services & data)."
   set +e
   maybe_sudo systemctl stop gvmd gsad ospd-openvas openvasd 2>/dev/null
   maybe_sudo systemctl disable gvmd gsad ospd-openvas openvasd 2>/dev/null
@@ -192,15 +164,13 @@ if (( UNINSTALL )); then
   maybe_sudo rm -rf /var/lib/{gvm,openvas,notus} /var/log/gvm /etc/openvas /run/gvmd
   maybe_sudo userdel gvm 2>/dev/null || true
   maybe_sudo groupdel gvm 2>/dev/null || true
-  set -e
-  log "Uninstall finished."
-  exit 0
+  set -e; log "Uninstall finished."; exit 0
 fi
 
-# ---------------- Docker path (optional) ----------------
+# ---------------- Docker quick path ----------------
 if [[ "$OS_ID" == "macos" || "$USE_DOCKER" -eq 1 ]]; then
   command -v docker >/dev/null 2>&1 || { err "Docker required"; exit 1; }
-  log "Deploying Docker stack."
+  log "Deploy Docker stack"
   mkdir -p docker
   cat > docker/docker-compose.yml <<YAML
 version: "3.9"
@@ -222,8 +192,7 @@ services:
 volumes: {gvm-data:{},gvm-log:{},openvas-data:{},notus:{}}
 YAML
   (cd docker && docker compose up -d)
-  log "Docker up -> http://localhost:${PORT}/"
-  exit 0
+  log "Docker ready -> http://localhost:${PORT}/"; exit 0
 fi
 
 # ---------------- Native build ----------------
@@ -240,7 +209,7 @@ elif [[ "$OS_ID" == "arch" ]]; then
   run sudo pacman -Syu --noconfirm base-devel curl cmake python gnupg rsync git wget
 fi
 
-# GPG community key
+# GPG key
 if ! gpg -k 8AE4BE429B60A59B311C2E739823FAA60ED1E580 >/dev/null 2>&1; then
   fetch https://www.greenbone.net/GBCommunitySigningKey.asc /tmp/GBCommunitySigningKey.asc
   gpg --import /tmp/GBCommunitySigningKey.asc || true
@@ -297,7 +266,7 @@ build_cmake_component "pg-gvm" "$PG_GVM_VERSION" \
   "https://github.com/greenbone/pg-gvm/releases/download/v$PG_GVM_VERSION/pg-gvm-$PG_GVM_VERSION.tar.gz.asc" \
   -DCMAKE_BUILD_TYPE=Release
 
-# ---------------- GSA dist (copy) ----------------
+# ---------------- GSA dist ----------------
 log "Install GSA dist $GSA_VERSION"
 T="$SOURCE_DIR/gsa-$GSA_VERSION.tar.gz"
 fetch_and_verify \
@@ -351,18 +320,15 @@ maybe_sudo mkdir -p /etc/openvas
 echo "table_driven_lsc = yes" | maybe_sudo tee /etc/openvas/openvas.conf >/dev/null
 echo "openvasd_server = http://127.0.0.1:3000" | maybe_sudo tee -a /etc/openvas/openvas.conf >/dev/null
 
-# ---------------- ospd-openvas (pip vs Debian fix) ----------------
-log "Install ospd-openvas $OSPD_OPENVAS_VERSION (pip over Debian fix)"
-# Remove distro package if present (to avoid 'RECORD not found' error)
+# ---------------- ospd-openvas (pip vs distro fix) ----------------
+log "Install ospd-openvas $OSPD_OPENVAS_VERSION (pip over distro)"
 if command -v dpkg >/dev/null 2>&1 && dpkg -s python3-ospd-openvas >/dev/null 2>&1; then
-  wrn "Removing Debian package python3-ospd-openvas"
-  sudo apt remove -y python3-ospd-openvas || true
+  wrn "Removing Debian package python3-ospd-openvas"; sudo apt remove -y python3-ospd-openvas || true
 fi
 if command -v rpm >/dev/null 2>&1 && rpm -q python3-ospd-openvas >/dev/null 2>&1; then
   wrn "Removing RPM package python3-ospd-openvas"
   (sudo dnf remove -y python3-ospd-openvas || sudo yum remove -y python3-ospd-openvas) || true
 fi
-# Python deps
 if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then
   run sudo apt install -y python3 python3-pip python3-setuptools python3-packaging python3-wrapt \
     python3-cffi python3-psutil python3-lxml python3-defusedxml python3-paramiko \
@@ -380,22 +346,31 @@ maybe_sudo cp -rv "$INSTALL_DIR/ospd-openvas"/* /
 
 # ---------------- openvasd (Rust) ----------------
 log "Build openvasd $OPENVAS_DAEMON (rust)"
-if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then
+build_openvasd(){
+  local SRC_DIR="$1"
   if ! command -v cargo >/dev/null 2>&1; then curl https://sh.rustup.rs -sSf | sh -s -- -y; source "$HOME/.cargo/env"; fi
-  sudo apt install -y pkg-config libssl-dev; rustup update stable || true
-fi
+  case "$OS_ID" in
+    ubuntu|debian|kali) sudo apt install -y pkg-config libssl-dev || true ;;
+    fedora|rhel|rocky|alma|centos) sudo dnf -y install openssl-devel || true ;;
+    arch) sudo pacman -S --noconfirm openssl || true ;;
+  esac
+  rustup update stable || true
+  export CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
+  export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
+  export CARGO_TARGET_DIR="$SRC_DIR/rust/target"
+  mkdir -p "$CARGO_TARGET_DIR/release/deps"
+  ( cd "$SRC_DIR/rust/src/openvasd" && cargo build --release )
+  ( cd "$SRC_DIR/rust/src/scannerctl" && cargo build --release )
+  install -D -m 0755 "$CARGO_TARGET_DIR/release/openvasd" /usr/local/bin/openvasd || true
+  install -D -m 0755 "$CARGO_TARGET_DIR/release/scannerctl" /usr/local/bin/scannerctl || true
+}
 T="$SOURCE_DIR/openvas-scanner-$OPENVAS_DAEMON.tar.gz"
 fetch_and_verify \
   "https://github.com/greenbone/openvas-scanner/archive/refs/tags/v$OPENVAS_DAEMON.tar.gz" \
   "https://github.com/greenbone/openvas-scanner/releases/download/v$OPENVAS_DAEMON/openvas-scanner-v$OPENVAS_DAEMON.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/openvas-scanner-$OPENVAS_DAEMON"; extract_clean "$T" "$SRC_DIR"
-mkdir -p "$INSTALL_DIR/openvasd/usr/local/bin"
-( cd "$SRC_DIR/rust/src/openvasd" && cargo build --release )
-( cd "$SRC_DIR/rust/src/scannerctl" && cargo build --release )
-maybe_sudo cp -v "$SRC_DIR/target/release/openvasd" "$INSTALL_DIR/openvasd/usr/local/bin/" || true
-maybe_sudo cp -v "$SRC_DIR/target/release/scannerctl" "$INSTALL_DIR/openvasd/usr/local/bin/" || true
-maybe_sudo cp -rv "$INSTALL_DIR/openvasd"/* / || true
+build_openvasd "$SRC_DIR"
 
 # ---------------- Redis config ----------------
 log "Configure Redis"
@@ -446,11 +421,14 @@ if [[ -x "$INSTALL_PREFIX/sbin/gvmd" ]]; then
   [[ -n "$owner" ]] && maybe_sudo "$INSTALL_PREFIX/sbin/gvmd" --modify-setting 78eceaec-3385-11ea-b237-28d24461215b --value "$owner" || true
 fi
 
-# ---------------- systemd (hardened) ----------------
+# ---------------- systemd units ----------------
 log "Install systemd units"
 mkunit(){
   local name="$1" body="$2" tmp="$BUILD_DIR/$1.service"
-  printf "%s" "$2" > "$tmp"; safe_install "$tmp" "/etc/systemd/system/$1.service" 0644
+  printf "%s" "$body" > "$tmp"; if [[ -e "/etc/systemd/system/$1.service" ]]; then
+    if ! ask_overwrite "/etc/systemd/system/$1.service"; then wrn "SKIP unit $1"; return; fi
+  fi
+  maybe_sudo install -m 0644 "$tmp" "/etc/systemd/system/$1.service"
 }
 mkunit "ospd-openvas" "[Unit]
 Description=OSPd Wrapper for OpenVAS
@@ -466,10 +444,6 @@ PIDFile=/run/ospd/ospd-openvas.pid
 ExecStart=/usr/local/bin/ospd-openvas --foreground --unix-socket /run/ospd/ospd-openvas.sock --pid-file /run/ospd/ospd-openvas.pid --log-file /var/log/gvm/ospd-openvas.log --lock-file-dir /var/lib/openvas --socket-mode 0o770 --notus-feed-dir /var/lib/notus/advisories
 Restart=always
 RestartSec=60
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=true
-PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 "
@@ -487,10 +461,6 @@ RuntimeDirectoryMode=2775
 ExecStart=/usr/local/sbin/gvmd --foreground --osp-vt-update=/run/ospd/ospd-openvas.sock --listen-group=gvm
 Restart=always
 TimeoutStopSec=10
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=true
-PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 "
@@ -508,10 +478,6 @@ PIDFile=/run/gsad/gsad.pid
 ExecStart=/usr/local/sbin/gsad --foreground --listen=127.0.0.1 --port=9392 --http-only
 Restart=always
 TimeoutStopSec=10
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=true
-PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 Alias=greenbone-security-assistant.service
@@ -526,10 +492,6 @@ RuntimeDirectoryMode=2775
 ExecStart=/usr/local/bin/openvasd --mode service_notus --products /var/lib/notus/products --advisories /var/lib/notus/advisories --listening 127.0.0.1:3000
 Restart=always
 RestartSec=60
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=true
-PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 "
@@ -537,13 +499,12 @@ maybe_sudo systemctl daemon-reload
 maybe_sudo systemctl enable ospd-openvas gvmd gsad openvasd --now || true
 
 # ---------------- Feed sync ----------------
-if (( SKIP_FEED )); then
-  wrn "Skipping initial feed sync"
-else
+if (( SKIP_FEED )); then wrn "Skipping initial feed sync"; else
   log "Run greenbone-feed-sync (first sync may take long)"
   python3 -m pip install --user --upgrade greenbone-feed-sync || true
   BIN="$(python3 -m site --user-base)/bin/greenbone-feed-sync"
-  if [[ -x "$BIN" ]]; then maybe_sudo "$BIN"; elif command -v greenbone-feed-sync >/dev/null 2>&1; then maybe_sudo greenbone-feed-sync; fi
+  if [[ -x "$BIN" ]]; then maybe_sudo "$BIN"
+  elif command -v greenbone-feed-sync >/dev/null 2>&1; then maybe_sudo greenbone-feed-sync; fi
 fi
 
 log "DONE 🎉  Open GSA: http://127.0.0.1:${PORT}/  user=${GVM_ADMIN_USER} pass=${GVM_ADMIN_PASS}"
