@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenVAS / Greenbone CE — Universal Installer (FINAL)
-# - One-command install, idempotent, overwrite/reinstall, Debian pip conflict fix
-# - GSSAPI fix (libkrb5-dev/krb5-devel), GSA rsync, systemd hardening, logging
+# OpenVAS / Greenbone CE — Universal Installer (FINAL, COMPLETE)
+# One-command install, idempotent, overwrite/reinstall, Debian pip conflict fix
+# GSSAPI fix (libkrb5-dev/krb5-devel), GSA rsync, systemd hardening, logging
 # Repo: https://github.com/AbdulRhmanAbdulGhaffar/OpenVAS-Install-All-Systems
 # License: MIT
 # ==============================================================================
@@ -30,11 +30,10 @@ OPENVAS_SCANNER_VERSION="${OPENVAS_SCANNER_VERSION:-23.20.1}"
 OSPD_OPENVAS_VERSION="${OSPD_OPENVAS_VERSION:-22.9.0}"
 OPENVAS_DAEMON="${OPENVAS_DAEMON:-23.20.0}"
 
-# Directories (fixed unbound issues)
+# Directories (fix any unbound issues)
 SOURCE_DIR="${SOURCE_DIR:-$HOME/source}"
 BUILD_DIR="${BUILD_DIR:-$HOME/build}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/install}"
-# Backward-compat for any old scripts using SRC var
 SRC="${SRC:-$SOURCE_DIR}"
 
 mkdir -p "$SOURCE_DIR" "$BUILD_DIR" "$INSTALL_DIR"
@@ -67,15 +66,15 @@ ask_overwrite(){
 
 safe_install(){
   # safe_install <src> <dest> [mode] [owner:group]
-  local src="$1" dest="$2" mode="${3:-}" own="${4:-}"
-  if [[ -e "$dest" ]]; then
-    if ! ask_overwrite "$dest"; then wrn "SKIP: $dest"; return 0; fi
-    local bak="${dest}.bak.$(date +%Y%m%d-%H%M%S)"
-    wrn "Backup: $dest -> $bak"
-    maybe_sudo mv -f "$dest" "$bak"
+  local s="$1" d="$2" mode="${3:-}" own="${4:-}"
+  if [[ -e "$d" ]]; then
+    if ! ask_overwrite "$d"; then wrn "SKIP: $d"; return 0; fi
+    local bak="${d}.bak.$(date +%Y%m%d-%H%M%S)"
+    wrn "Backup: $d -> $bak"
+    maybe_sudo mv -f "$d" "$bak"
   fi
-  maybe_sudo install -D ${mode:+-m "$mode"} "$src" "$dest"
-  [[ -n "$own" ]] && maybe_sudo chown "$own" "$dest"
+  maybe_sudo install -D ${mode:+-m "$mode"} "$s" "$d"
+  [[ -n "$own" ]] && maybe_sudo chown "$own" "$d"
 }
 
 extract_clean(){
@@ -247,9 +246,9 @@ fetch_and_verify \
   "https://github.com/greenbone/gvm-libs/releases/download/v$GVM_LIBS_VERSION/gvm-libs-$GVM_LIBS_VERSION.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/gvm-libs-$GVM_LIBS_VERSION"; extract_clean "$T" "$SRC_DIR"
-BUILD_DIR_LIBS="$BUILD_DIR/gvm-libs"; [[ -d "$BUILD_DIR_LIBS" && $(component_should_rebuild gvm-libs) ]] && rm -rf "$BUILD_DIR_LIBS"
-cmake -S "$SRC_DIR" -B "$BUILD_DIR_LIBS" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var
-cmake --build "$BUILD_DIR_LIBS" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvm-libs" && cd "$BUILD_DIR_LIBS"
+BLD_LIBS="$BUILD_DIR/gvm-libs"; [[ -d "$BLD_LIBS" && $(component_should_rebuild gvm-libs) ]] && rm -rf "$BLD_LIBS"
+cmake -S "$SRC_DIR" -B "$BLD_LIBS" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var
+cmake --build "$BLD_LIBS" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvm-libs" && cd "$BLD_LIBS"
 make DESTDIR="$INSTALL_DIR/gvm-libs" install; maybe_sudo cp -rv "$INSTALL_DIR/gvm-libs"/* /
 
 # ---------------- gvmd ----------------
@@ -263,12 +262,12 @@ fetch_and_verify \
   "https://github.com/greenbone/gvmd/releases/download/v$GVMD_VERSION/gvmd-$GVMD_VERSION.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/gvmd-$GVMD_VERSION"; extract_clean "$T" "$SRC_DIR"
-BUILD_DIR_GVMD="$BUILD_DIR/gvmd"; [[ -d "$BUILD_DIR_GVMD" && $(component_should_rebuild gvmd) ]] && rm -rf "$BUILD_DIR_GVMD"
-cmake -S "$SRC_DIR" -B "$BUILD_DIR_GVMD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+BLD_GVMD="$BUILD_DIR/gvmd"; [[ -d "$BLD_GVMD" && $(component_should_rebuild gvmd) ]] && rm -rf "$BLD_GVMD"
+cmake -S "$SRC_DIR" -B "$BLD_GVMD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DLOCALSTATEDIR=/var -DSYSCONFDIR=/etc -DGVM_DATA_DIR=/var -DGVM_LOG_DIR=/var/log/gvm \
   -DGVMD_RUN_DIR=/run/gvmd -DOPENVAS_DEFAULT_SOCKET=/run/ospd/ospd-openvas.sock \
   -DGVM_FEED_LOCK_PATH=/var/lib/gvm/feed-update.lock -DLOGROTATE_DIR=/etc/logrotate.d
-cmake --build "$BUILD_DIR_GVMD" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvmd" && cd "$BUILD_DIR_GVMD"
+cmake --build "$BLD_GVMD" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvmd" && cd "$BLD_GVMD"
 make DESTDIR="$INSTALL_DIR/gvmd" install; maybe_sudo cp -rv "$INSTALL_DIR/gvmd"/* /
 
 # ---------------- pg-gvm ----------------
@@ -280,9 +279,9 @@ fetch_and_verify \
   "https://github.com/greenbone/pg-gvm/releases/download/v$PG_GVM_VERSION/pg-gvm-$PG_GVM_VERSION.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/pg-gvm-$PG_GVM_VERSION"; extract_clean "$T" "$SRC_DIR"
-BUILD_DIR_PG="$BUILD_DIR/pg-gvm"; [[ -d "$BUILD_DIR_PG" && $(component_should_rebuild pg-gvm) ]] && rm -rf "$BUILD_DIR_PG"
-cmake -S "$SRC_DIR" -B "$BUILD_DIR_PG" -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BUILD_DIR_PG" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/pg-gvm" && cd "$BUILD_DIR_PG"
+BLD_PG="$BUILD_DIR/pg-gvm"; [[ -d "$BLD_PG" && $(component_should_rebuild pg-gvm) ]] && rm -rf "$BLD_PG"
+cmake -S "$SRC_DIR" -B "$BLD_PG" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$BLD_PG" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/pg-gvm" && cd "$BLD_PG"
 make DESTDIR="$INSTALL_DIR/pg-gvm" install; maybe_sudo cp -rv "$INSTALL_DIR/pg-gvm"/* /
 
 # ---------------- GSA dist ----------------
@@ -305,11 +304,11 @@ fetch_and_verify \
   "https://github.com/greenbone/gsad/releases/download/v$GSAD_VERSION/gsad-$GSAD_VERSION.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/gsad-$GSAD_VERSION"; extract_clean "$T" "$SRC_DIR"
-BUILD_DIR_GSAD="$BUILD_DIR/gsad"; [[ -d "$BUILD_DIR_GSAD" && $(component_should_rebuild gsad) ]] && rm -rf "$BUILD_DIR_GSAD"
-cmake -S "$SRC_DIR" -B "$BUILD_DIR_GSAD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+BLD_GSAD="$BUILD_DIR/gsad"; [[ -d "$BLD_GSAD" && $(component_should_rebuild gsad) ]] && rm -rf "$BLD_GSAD"
+cmake -S "$SRC_DIR" -B "$BLD_GSAD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DGVMD_RUN_DIR=/run/gvmd -DGSAD_RUN_DIR=/run/gsad \
   -DGVM_LOG_DIR=/var/log/gvm -DLOGROTATE_DIR=/etc/logrotate.d
-cmake --build "$BUILD_DIR_GSAD" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gsad" && cd "$BUILD_DIR_GSAD"
+cmake --build "$BLD_GSAD" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gsad" && cd "$BLD_GSAD"
 make DESTDIR="$INSTALL_DIR/gsad" install; maybe_sudo cp -rv "$INSTALL_DIR/gsad"/* /
 
 # ---------------- openvas-smb (optional) ----------------
@@ -323,10 +322,10 @@ fetch_and_verify \
   "https://github.com/greenbone/openvas-smb/releases/download/v$OPENVAS_SMB_VERSION/openvas-smb-v$OPENVAS_SMB_VERSION.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/openvas-smb-$OPENVAS_SMB_VERSION"; extract_clean "$T" "$SRC_DIR"
-BUILD_DIR_SMB="$BUILD_DIR/openvas-smb"; [[ -d "$BUILD_DIR_SMB" && $(component_should_rebuild smb) ]] && rm -rf "$BUILD_DIR_SMB"
-cmake -S "$SRC_DIR" -B "$BUILD_DIR_SMB" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BUILD_DIR_SMB" -j"$(nproc)" || wrn "openvas-smb build issue (optional)"
-mkdir -p "$INSTALL_DIR/openvas-smb" && cd "$BUILD_DIR_SMB"
+BLD_SMB="$BUILD_DIR/openvas-smb"; [[ -d "$BLD_SMB" && $(component_should_rebuild smb) ]] && rm -rf "$BLD_SMB"
+cmake -S "$SRC_DIR" -B "$BLD_SMB" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$BLD_SMB" -j"$(nproc)" || wrn "openvas-smb build issue (optional)"
+mkdir -p "$INSTALL_DIR/openvas-smb" && cd "$BLD_SMB"
 make DESTDIR="$INSTALL_DIR/openvas-smb" install || true
 maybe_sudo cp -rv "$INSTALL_DIR/openvas-smb"/* / || wrn "openvas-smb skipped."
 
@@ -348,11 +347,11 @@ fetch_and_verify \
   "https://github.com/greenbone/openvas-scanner/releases/download/v$OPENVAS_SCANNER_VERSION/openvas-scanner-v$OPENVAS_SCANNER_VERSION.tar.gz.asc" \
   "$T"
 SRC_DIR="$SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION"; extract_clean "$T" "$SRC_DIR"
-BUILD_DIR_SCANNER="$BUILD_DIR/openvas-scanner"; [[ -d "$BUILD_DIR_SCANNER" && $(component_should_rebuild scanner) ]] && rm -rf "$BUILD_DIR_SCANNER"
-cmake -S "$SRC_DIR" -B "$BUILD_DIR_SCANNER" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+BLD_SCANNER="$BUILD_DIR/openvas-scanner"; [[ -d "$BLD_SCANNER" && $(component_should_rebuild scanner) ]] && rm -rf "$BLD_SCANNER"
+cmake -S "$SRC_DIR" -B "$BLD_SCANNER" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DOPENVAS_FEED_LOCK_PATH=/var/lib/openvas/feed-update.lock \
   -DOPENVAS_RUN_DIR=/run/ospd
-cmake --build "$BUILD_DIR_SCANNER" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/openvas-scanner" && cd "$BUILD_DIR_SCANNER"
+cmake --build "$BLD_SCANNER" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/openvas-scanner" && cd "$BLD_SCANNER"
 make DESTDIR="$INSTALL_DIR/openvas-scanner" install; maybe_sudo cp -rv "$INSTALL_DIR/openvas-scanner"/* /
 maybe_sudo mkdir -p /etc/openvas
 echo "table_driven_lsc = yes" | maybe_sudo tee /etc/openvas/openvas.conf >/dev/null
@@ -382,7 +381,6 @@ fetch_and_verify \
   "$T"
 SRC_DIR="$SOURCE_DIR/ospd-openvas-$OSPD_OPENVAS_VERSION"; extract_clean "$T" "$SRC_DIR"
 mkdir -p "$INSTALL_DIR/ospd-openvas"; cd "$SRC_DIR"
-# Key fix: don't uninstall system package; install into staging root
 python3 -m pip install --ignore-installed --no-deps --no-warn-script-location --root="$INSTALL_DIR/ospd-openvas" .
 maybe_sudo cp -rv "$INSTALL_DIR/ospd-openvas"/* /
 
@@ -442,8 +440,9 @@ fetch https://www.greenbone.net/GBCommunitySigningKey.asc /tmp/GBCommunitySignin
 gpg --import /tmp/GBCommunitySigningKey.asc || true
 echo "8AE4BE429B60A59B311C2E739823FAA60ED1E580:6:" | gpg --import-ownertrust || true
 export OPENVAS_GNUPG_HOME=/etc/openvas/gnupg
-maybe_sudo mkdir -p "$OPENVAS_GNUPG_HOME"; maybe_sudo cp -r "$GNUPGHOME"/* "$OPENVAS_GNUPGHOME"/ || true
-maybe_sudo chown -R gvm:gvm "$OPENVAS_GNUPGHOME"
+maybe_sudo mkdir -p "$OPENVAS_GNUPG_HOME"
+maybe_sudo cp -r "$GNUPGHOME"/* "$OPENVAS_GNUPG_HOME"/ || true
+maybe_sudo chown -R gvm:gvm "$OPENVAS_GNUPG_HOME"
 
 # ---------------- Admin & Feed Owner ----------------
 log "Create admin & set Feed Import Owner"
