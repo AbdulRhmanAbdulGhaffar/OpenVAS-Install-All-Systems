@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenVAS / Greenbone CE — Universal Installer (FINAL)
-# One-command install, idempotent, overwrite/reinstall, Debian pip conflict fix
-# GSSAPI fix (libkrb5-dev/krb5-devel), GSA rsync, systemd hardening, logging
-# Repo: https://github.com/AbdulRhmanAbdulGhaffar/OpenVAS-Install-All-Systems
-# License: MIT
+# OpenVAS / Greenbone CE — Universal Installer (FINAL ALL-IN-ONE)
+# - Fix GitHub tarball nested dir (strip-components=1)
+# - Fix Debian pip conflict for ospd-openvas
+# - Install libkrb5-dev/krb5-devel (gssapi.h)
+# - Overwrite policy & reuse-sources
+# - Logging + systemd units + feed sync
 # ==============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---------------- Defaults & Flags ----------------
+# ---------------- Defaults ----------------
 OS_ID=""; USE_DOCKER=0; IS_WSL=0; PORT=9392; WITH_POSTGRES=1; NO_SUDO=0
 SKIP_FEED=0; NONINTERACTIVE=0; VERBOSE=0; UNINSTALL=0
-OVERWRITE_MODE="ask"    # ask|skip|force
-REINSTALL="none"        # none|all|gvm-libs|gvmd|pg-gvm|gsa|gsad|smb|scanner|ospd|openvasd
+OVERWRITE_MODE="ask"         # ask|skip|force
+REUSE_SOURCES=0              # 0/1  -> --reuse-sources لتخطي فك الأرشيف لو موجود
+REINSTALL="none"             # none|all|gvm-libs|gvmd|pg-gvm|gsa|gsad|smb|scanner|ospd|openvasd
 
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 GVM_ADMIN_USER="${GVM_ADMIN_USER:-admin}"
@@ -30,18 +32,17 @@ OPENVAS_SCANNER_VERSION="${OPENVAS_SCANNER_VERSION:-23.20.1}"
 OSPD_OPENVAS_VERSION="${OSPD_OPENVAS_VERSION:-22.9.0}"
 OPENVAS_DAEMON="${OPENVAS_DAEMON:-23.20.0}"
 
-# Directories (avoid unbound)
 SOURCE_DIR="${SOURCE_DIR:-$HOME/source}"
 BUILD_DIR="${BUILD_DIR:-$HOME/build}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/install}"
-SRC="${SRC:-$SOURCE_DIR}"
 mkdir -p "$SOURCE_DIR" "$BUILD_DIR" "$INSTALL_DIR"
 
-# ---------------- Utils ----------------
+# ---------------- Logging ----------------
 LOGFILE="/var/log/gvm/install.log"
 mkdir -p /var/log/gvm 2>/dev/null || true
 exec > >(tee -a "$LOGFILE") 2>&1
 
+# ---------------- Utils ----------------
 log(){ printf "\033[1;32m[+] \033[0m%s\n" "$*"; }
 wrn(){ printf "\033[1;33m[!] \033[0m%s\n" "$*"; }
 err(){ printf "\033[1;31m[x] \033[0m%s\n" "$*"; } >&2
@@ -49,6 +50,41 @@ run(){ if (( VERBOSE )); then set -x; fi; "$@"; if (( VERBOSE )); then set +x; f
 maybe_sudo(){ if (( NO_SUDO )); then "$@"; else sudo "$@"; fi; }
 component_should_rebuild(){ [[ "$REINSTALL" == "all" || "$REINSTALL" == "$1" ]]; }
 
+usage(){ cat <<EOF
+Usage: $0 [OPTIONS]
+  --os <id>            ubuntu|debian|kali|fedora|rhel|rocky|alma|centos|arch|macos|generic
+  --use-docker         Use official Docker images
+  --port <num>         GSA port (default 9392)
+  --no-postgres        Skip local PostgreSQL
+  --skip-feed-sync     Don't run initial feed sync
+  --overwrite <ask|skip|force>  Overwrite policy (default ask)
+  --reuse-sources      Reuse existing sources (skip extracting tarballs)
+  --reinstall <target|all>      Rebuild specific component
+  --yes|-y             Non-interactive
+  --verbose            Verbose output
+  --uninstall          Remove all services/files
+  -h|--help            Show help
+EOF
+}
+
+# ---------------- Arg Parse ----------------
+while (( $# )); do case "$1" in
+  --os) OS_ID="$2"; shift;;
+  --use-docker) USE_DOCKER=1;;
+  --port) PORT="$2"; shift;;
+  --no-postgres) WITH_POSTGRES=0;;
+  --skip-feed-sync) SKIP_FEED=1;;
+  --overwrite) OVERWRITE_MODE="$2"; shift;;
+  --reuse-sources) REUSE_SOURCES=1;;
+  --reinstall) REINSTALL="$2"; shift;;
+  --yes|-y) NONINTERACTIVE=1;;
+  --verbose) VERBOSE=1;;
+  --uninstall) UNINSTALL=1;;
+  -h|--help) usage; exit 0;;
+  *) err "Unknown option: $1"; usage; exit 2;;
+esac; shift; done
+
+# ---------------- Helper funcs ----------------
 ask_overwrite(){
   local path="$1"
   case "$OVERWRITE_MODE" in
@@ -75,10 +111,26 @@ safe_install(){
   [[ -n "$own" ]] && maybe_sudo chown "$own" "$d"
 }
 
-# ---- Fixed extractor: handles nested top-level directory names from tarballs
+fetch(){ curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 "$1" -o "$2"; }
+fetch_and_verify(){
+  # fetch_and_verify <url_tar> <url_asc> <out_tar>
+  local url="$1" sig="$2" tar="$3" asc="${3}.asc"
+  if ! (( REUSE_SOURCES )) || [[ ! -f "$tar" ]]; then
+    fetch "$url" "$tar"; fetch "$sig" "$asc"
+  else
+    wrn "Using existing tar: $tar"
+  fi
+  gpg --verify "$asc" "$tar"
+}
+
+# ---------- UNIVERSAL TAR EXTRACT (fix nested top dir) ----------
 extract_clean(){
   # extract_clean <tar.gz> <target_dir>
   local tarfile="$1" target="$2"
+  if (( REUSE_SOURCES )) && [[ -d "$target" ]]; then
+    wrn "REUSE_SOURCES=1 -> using existing: $target"
+    return 0
+  fi
   if [[ -d "$target" ]]; then
     case "$OVERWRITE_MODE" in
       force) rm -rf "$target";;
@@ -87,72 +139,39 @@ extract_clean(){
              rm -rf "$target";;
     esac
   fi
-  local topdir
-  topdir="$(tar -tzf "$tarfile" | head -1 | cut -d/ -f1)"
-  tar -C "$SOURCE_DIR" -xzf "$tarfile"
-  mkdir -p "$(dirname "$target")"
-  # انقل المجلد الداخلي للمسار المطلوب (بدون طبقة إضافية)
-  mv -T "$SOURCE_DIR/$topdir" "$target"
+  mkdir -p "$target"
+  tar -C "$target" --strip-components=1 -xzf "$tarfile"
 }
 
-# ترجع مجلد السورس اللي فيه CMakeLists.txt لو الاسم اختلف
-real_src(){
-  # real_src <dir-expected>
+# لو لأي سبب مش لاقي CMakeLists، دوّر تلقائيًا
+ensure_cmake_src(){
   local base="$1"
-  if [[ -f "$base/CMakeLists.txt" ]]; then
-    printf "%s\n" "$base"
-  else
-    find "$base" -maxdepth 2 -type f -name CMakeLists.txt -printf '%h\n' -quit
-  fi
+  if [[ -f "$base/CMakeLists.txt" ]]; then printf "%s\n" "$base"; return 0; fi
+  local found; found="$(find "$base" -maxdepth 3 -type f -name CMakeLists.txt -printf '%h\n' -quit || true)"
+  [[ -n "$found" ]] && printf "%s\n" "$found" || { err "CMakeLists.txt not found under $base"; return 1; }
 }
 
-fetch(){ curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 "$1" -o "$2"; }
-fetch_and_verify(){
-  # fetch_and_verify <url_tar> <url_asc> <out_tar>
-  local url="$1" sig="$2" tar="$3" asc="${3}.asc"
-  if [[ -f "$tar" && "$OVERWRITE_MODE" == "skip" ]]; then
-    wrn "SKIP download (exists): $tar"
-  else
-    if [[ -f "$tar" && "$OVERWRITE_MODE" == "ask" ]]; then
-      ask_overwrite "$tar" || wrn "Using existing $tar"
-    fi
-    fetch "$url" "$tar"
-    fetch "$sig" "$asc"
-  fi
-  gpg --verify "$asc" "$tar"
-}
+# دالة موحّدة لبناء أي كومبوننت CMake
+build_cmake_component(){
+  # build_cmake_component <name> <version> <url_tar> <url_sig> <cmake-args...>
+  local NAME="$1" VER="$2" URL="$3" SIG="$4"; shift 4
+  local TAR="$SOURCE_DIR/${NAME}-${VER}.tar.gz"
+  local SRC_DIR="$SOURCE_DIR/${NAME}-${VER}"
+  local BLD_DIR="$BUILD_DIR/${NAME}"
+  local INS_DIR="$INSTALL_DIR/${NAME}"
 
-usage(){ cat <<EOF
-Usage: $0 [OPTIONS]
-  --os <id>            ubuntu|debian|kali|fedora|rhel|rocky|alma|centos|arch|macos|generic
-  --use-docker         Use official Docker images
-  --port <num>         GSA port (default 9392)
-  --no-postgres        Skip local PostgreSQL
-  --skip-feed-sync     Don't run initial feed sync
-  --overwrite <ask|skip|force>  Overwrite policy
-  --reinstall <target|all>      Rebuild specific component
-  --yes|-y             Non-interactive
-  --verbose            Verbose output
-  --uninstall          Remove all services/files
-  -h|--help            Show help
-EOF
-}
+  fetch_and_verify "$URL" "$SIG" "$TAR"
+  extract_clean "$TAR" "$SRC_DIR"
+  SRC_DIR="$(ensure_cmake_src "$SRC_DIR")"
 
-# ---------------- Arg Parse ----------------
-while (( $# )); do case "$1" in
-  --os) OS_ID="$2"; shift;;
-  --use-docker) USE_DOCKER=1;;
-  --port) PORT="$2"; shift;;
-  --no-postgres) WITH_POSTGRES=0;;
-  --skip-feed-sync) SKIP_FEED=1;;
-  --overwrite) OVERWRITE_MODE="$2"; shift;;
-  --reinstall) REINSTALL="$2"; shift;;
-  --yes|-y) NONINTERACTIVE=1;;
-  --verbose) VERBOSE=1;;
-  --uninstall) UNINSTALL=1;;
-  -h|--help) usage; exit 0;;
-  *) err "Unknown option: $1"; usage; exit 2;;
-esac; shift; done
+  [[ -d "$BLD_DIR" ]] && rm -rf "$BLD_DIR"
+  cmake -S "$SRC_DIR" -B "$BLD_DIR" "$@"
+  cmake --build "$BLD_DIR" -j"$(nproc)"
+
+  mkdir -p "$INS_DIR" && cd "$BLD_DIR"
+  make DESTDIR="$INS_DIR" install
+  maybe_sudo cp -rv "$INS_DIR"/* /
+}
 
 # ---------------- Detect OS ----------------
 if [[ -z "$OS_ID" ]]; then
@@ -178,7 +197,7 @@ if (( UNINSTALL )); then
   exit 0
 fi
 
-# ---------------- Docker path ----------------
+# ---------------- Docker path (optional) ----------------
 if [[ "$OS_ID" == "macos" || "$USE_DOCKER" -eq 1 ]]; then
   command -v docker >/dev/null 2>&1 || { err "Docker required"; exit 1; }
   log "Deploying Docker stack."
@@ -251,51 +270,34 @@ if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then
     libgnutls28-dev libgpgme-dev libhiredis-dev libnet1-dev libpaho-mqtt-dev \
     libpcap-dev libssh-dev libxml2-dev uuid-dev libldap2-dev libradcli-dev
 fi
-T="$SOURCE_DIR/gvm-libs-$GVM_LIBS_VERSION.tar.gz"
-fetch_and_verify \
+build_cmake_component "gvm-libs" "$GVM_LIBS_VERSION" \
   "https://github.com/greenbone/gvm-libs/archive/refs/tags/v$GVM_LIBS_VERSION.tar.gz" \
   "https://github.com/greenbone/gvm-libs/releases/download/v$GVM_LIBS_VERSION/gvm-libs-$GVM_LIBS_VERSION.tar.gz.asc" \
-  "$T"
-SRC_DIR="$SOURCE_DIR/gvm-libs-$GVM_LIBS_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
-BLD_LIBS="$BUILD_DIR/gvm-libs"; [[ -d "$BLD_LIBS" && $(component_should_rebuild gvm-libs) ]] && rm -rf "$BLD_LIBS"
-cmake -S "$SRC_DIR" -B "$BLD_LIBS" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var
-cmake --build "$BLD_LIBS" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvm-libs" && cd "$BLD_LIBS"
-make DESTDIR="$INSTALL_DIR/gvm-libs" install; maybe_sudo cp -rv "$INSTALL_DIR/gvm-libs"/* /
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var
 
 # ---------------- gvmd ----------------
 log "Build gvmd $GVMD_VERSION"
 if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then
   run sudo apt install -y libbsd-dev libcjson-dev libglib2.0-dev libgnutls28-dev libgpgme-dev libical-dev libpq-dev rsync xsltproc
 fi
-T="$SOURCE_DIR/gvmd-$GVMD_VERSION.tar.gz"
-fetch_and_verify \
+build_cmake_component "gvmd" "$GVMD_VERSION" \
   "https://github.com/greenbone/gvmd/archive/refs/tags/v$GVMD_VERSION.tar.gz" \
   "https://github.com/greenbone/gvmd/releases/download/v$GVMD_VERSION/gvmd-$GVMD_VERSION.tar.gz.asc" \
-  "$T"
-SRC_DIR="$SOURCE_DIR/gvmd-$GVMD_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
-BLD_GVMD="$BUILD_DIR/gvmd"; [[ -d "$BLD_GVMD" && $(component_should_rebuild gvmd) ]] && rm -rf "$BLD_GVMD"
-cmake -S "$SRC_DIR" -B "$BLD_GVMD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
-  -DLOCALSTATEDIR=/var -DSYSCONFDIR=/etc -DGVM_DATA_DIR=/var -DGVM_LOG_DIR=/var/log/gvm \
-  -DGVMD_RUN_DIR=/run/gvmd -DOPENVAS_DEFAULT_SOCKET=/run/ospd/ospd-openvas.sock \
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+  -DLOCALSTATEDIR=/var -DSYSCONFDIR=/etc -DGVM_DATA_DIR=/var \
+  -DGVM_LOG_DIR=/var/log/gvm -DGVMD_RUN_DIR=/run/gvmd \
+  -DOPENVAS_DEFAULT_SOCKET=/run/ospd/ospd-openvas.sock \
   -DGVM_FEED_LOCK_PATH=/var/lib/gvm/feed-update.lock -DLOGROTATE_DIR=/etc/logrotate.d
-cmake --build "$BLD_GVMD" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gvmd" && cd "$BLD_GVMD"
-make DESTDIR="$INSTALL_DIR/gvmd" install; maybe_sudo cp -rv "$INSTALL_DIR/gvmd"/* /
 
 # ---------------- pg-gvm ----------------
 log "Build pg-gvm $PG_GVM_VERSION"
 if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then run sudo apt install -y libglib2.0-dev libical-dev postgresql-server-dev-all; fi
-T="$SOURCE_DIR/pg-gvm-$PG_GVM_VERSION.tar.gz"
-fetch_and_verify \
+build_cmake_component "pg-gvm" "$PG_GVM_VERSION" \
   "https://github.com/greenbone/pg-gvm/archive/refs/tags/v$PG_GVM_VERSION.tar.gz" \
   "https://github.com/greenbone/pg-gvm/releases/download/v$PG_GVM_VERSION/pg-gvm-$PG_GVM_VERSION.tar.gz.asc" \
-  "$T"
-SRC_DIR="$SOURCE_DIR/pg-gvm-$PG_GVM_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
-BLD_PG="$BUILD_DIR/pg-gvm"; [[ -d "$BLD_PG" && $(component_should_rebuild pg-gvm) ]] && rm -rf "$BLD_PG"
-cmake -S "$SRC_DIR" -B "$BLD_PG" -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BLD_PG" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/pg-gvm" && cd "$BLD_PG"
-make DESTDIR="$INSTALL_DIR/pg-gvm" install; maybe_sudo cp -rv "$INSTALL_DIR/pg-gvm"/* /
+  -DCMAKE_BUILD_TYPE=Release
 
-# ---------------- GSA dist ----------------
+# ---------------- GSA dist (copy) ----------------
 log "Install GSA dist $GSA_VERSION"
 T="$SOURCE_DIR/gsa-$GSA_VERSION.tar.gz"
 fetch_and_verify \
@@ -309,36 +311,22 @@ rsync -a --delete "$SRC_DIR"/ "$INSTALL_PREFIX/share/gvm/gsad/web"/
 # ---------------- gsad ----------------
 log "Build gsad $GSAD_VERSION"
 if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then run sudo apt install -y libbrotli-dev libglib2.0-dev libgnutls28-dev libmicrohttpd-dev libxml2-dev; fi
-T="$SOURCE_DIR/gsad-$GSAD_VERSION.tar.gz"
-fetch_and_verify \
+build_cmake_component "gsad" "$GSAD_VERSION" \
   "https://github.com/greenbone/gsad/archive/refs/tags/v$GSAD_VERSION.tar.gz" \
   "https://github.com/greenbone/gsad/releases/download/v$GSAD_VERSION/gsad-$GSAD_VERSION.tar.gz.asc" \
-  "$T"
-SRC_DIR="$SOURCE_DIR/gsad-$GSAD_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
-BLD_GSAD="$BUILD_DIR/gsad"; [[ -d "$BLD_GSAD" && $(component_should_rebuild gsad) ]] && rm -rf "$BLD_GSAD"
-cmake -S "$SRC_DIR" -B "$BLD_GSAD" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
-  -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DGVMD_RUN_DIR=/run/gvmd -DGSAD_RUN_DIR=/run/gsad \
-  -DGVM_LOG_DIR=/var/log/gvm -DLOGROTATE_DIR=/etc/logrotate.d
-cmake --build "$BLD_GSAD" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/gsad" && cd "$BLD_GSAD"
-make DESTDIR="$INSTALL_DIR/gsad" install; maybe_sudo cp -rv "$INSTALL_DIR/gsad"/* /
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+  -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DGVMD_RUN_DIR=/run/gvmd \
+  -DGSAD_RUN_DIR=/run/gsad -DGVM_LOG_DIR=/var/log/gvm -DLOGROTATE_DIR=/etc/logrotate.d
 
 # ---------------- openvas-smb (optional) ----------------
 log "Build openvas-smb $OPENVAS_SMB_VERSION (optional)"
 if [[ "$OS_ID" =~ ubuntu|debian|kali ]]; then
   run sudo apt install -y gcc-mingw-w64 libgnutls28-dev libglib2.0-dev libpopt-dev libunistring-dev heimdal-multidev perl-base
 fi
-T="$SOURCE_DIR/openvas-smb-$OPENVAS_SMB_VERSION.tar.gz"
-fetch_and_verify \
+build_cmake_component "openvas-smb" "$OPENVAS_SMB_VERSION" \
   "https://github.com/greenbone/openvas-smb/archive/refs/tags/v$OPENVAS_SMB_VERSION.tar.gz" \
   "https://github.com/greenbone/openvas-smb/releases/download/v$OPENVAS_SMB_VERSION/openvas-smb-v$OPENVAS_SMB_VERSION.tar.gz.asc" \
-  "$T"
-SRC_DIR="$SOURCE_DIR/openvas-smb-$OPENVAS_SMB_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
-BLD_SMB="$BUILD_DIR/openvas-smb"; [[ -d "$BLD_SMB" && $(component_should_rebuild smb) ]] && rm -rf "$BLD_SMB"
-cmake -S "$SRC_DIR" -B "$BLD_SMB" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BLD_SMB" -j"$(nproc)" || wrn "openvas-smb build issue (optional)"
-mkdir -p "$INSTALL_DIR/openvas-smb" && cd "$BLD_SMB"
-make DESTDIR="$INSTALL_DIR/openvas-smb" install || true
-maybe_sudo cp -rv "$INSTALL_DIR/openvas-smb"/* / || wrn "openvas-smb skipped."
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release || wrn "openvas-smb optional build issue"
 
 # ---------------- openvas-scanner ----------------
 log "Build openvas-scanner $OPENVAS_SCANNER_VERSION"
@@ -352,25 +340,20 @@ case "$OS_ID" in
   arch)
     run sudo pacman -S --noconfirm krb5 ;;
 esac
-T="$SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION.tar.gz"
-fetch_and_verify \
+build_cmake_component "openvas-scanner" "$OPENVAS_SCANNER_VERSION" \
   "https://github.com/greenbone/openvas-scanner/archive/refs/tags/v$OPENVAS_SCANNER_VERSION.tar.gz" \
   "https://github.com/greenbone/openvas-scanner/releases/download/v$OPENVAS_SCANNER_VERSION/openvas-scanner-v$OPENVAS_SCANNER_VERSION.tar.gz.asc" \
-  "$T"
-SRC_DIR="$SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION"; extract_clean "$T" "$SRC_DIR"; SRC_DIR="$(real_src "$SRC_DIR")"
-BLD_SCANNER="$BUILD_DIR/openvas-scanner"; [[ -d "$BLD_SCANNER" && $(component_should_rebuild scanner) ]] && rm -rf "$BLD_SCANNER"
-cmake -S "$SRC_DIR" -B "$BLD_SCANNER" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DSYSCONFDIR=/etc -DLOCALSTATEDIR=/var -DOPENVAS_FEED_LOCK_PATH=/var/lib/openvas/feed-update.lock \
   -DOPENVAS_RUN_DIR=/run/ospd
-cmake --build "$BLD_SCANNER" -j"$(nproc)"; mkdir -p "$INSTALL_DIR/openvas-scanner" && cd "$BLD_SCANNER"
-make DESTDIR="$INSTALL_DIR/openvas-scanner" install; maybe_sudo cp -rv "$INSTALL_DIR/openvas-scanner"/* /
+
 maybe_sudo mkdir -p /etc/openvas
 echo "table_driven_lsc = yes" | maybe_sudo tee /etc/openvas/openvas.conf >/dev/null
 echo "openvasd_server = http://127.0.0.1:3000" | maybe_sudo tee -a /etc/openvas/openvas.conf >/dev/null
 
 # ---------------- ospd-openvas (pip vs Debian fix) ----------------
 log "Install ospd-openvas $OSPD_OPENVAS_VERSION (pip over Debian fix)"
-# Remove Debian/RPM package if present to avoid pip uninstall error
+# Remove distro package if present (to avoid 'RECORD not found' error)
 if command -v dpkg >/dev/null 2>&1 && dpkg -s python3-ospd-openvas >/dev/null 2>&1; then
   wrn "Removing Debian package python3-ospd-openvas"
   sudo apt remove -y python3-ospd-openvas || true
@@ -463,7 +446,7 @@ if [[ -x "$INSTALL_PREFIX/sbin/gvmd" ]]; then
   [[ -n "$owner" ]] && maybe_sudo "$INSTALL_PREFIX/sbin/gvmd" --modify-setting 78eceaec-3385-11ea-b237-28d24461215b --value "$owner" || true
 fi
 
-# ---------------- systemd (with hardening) ----------------
+# ---------------- systemd (hardened) ----------------
 log "Install systemd units"
 mkunit(){
   local name="$1" body="$2" tmp="$BUILD_DIR/$1.service"
@@ -557,7 +540,7 @@ maybe_sudo systemctl enable ospd-openvas gvmd gsad openvasd --now || true
 if (( SKIP_FEED )); then
   wrn "Skipping initial feed sync"
 else
-  log "Run greenbone-feed-sync (first time may take long)"
+  log "Run greenbone-feed-sync (first sync may take long)"
   python3 -m pip install --user --upgrade greenbone-feed-sync || true
   BIN="$(python3 -m site --user-base)/bin/greenbone-feed-sync"
   if [[ -x "$BIN" ]]; then maybe_sudo "$BIN"; elif command -v greenbone-feed-sync >/dev/null 2>&1; then maybe_sudo greenbone-feed-sync; fi
