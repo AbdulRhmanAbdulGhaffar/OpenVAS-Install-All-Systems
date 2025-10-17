@@ -1,0 +1,13 @@
+http:
+  middlewares:
+    secHeaders:
+      headers:
+        frameDeny: true
+        sslredirect: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+
+tls:
+  options:
+    default:
+      sniStrict: true

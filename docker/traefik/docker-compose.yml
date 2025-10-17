@@ -1,0 +1,63 @@
+version: "3.9"
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    command:
+      - "--api.dashboard=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./dynamic:/etc/traefik/dynamic
+      - traefik_letsencrypt:/letsencrypt
+    networks:
+      - web
+
+  gvmd:
+    image: greenbone/gvmd:stable
+    env_file: ../.env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gvmd.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.gvmd.entrypoints=websecure"
+      - "traefik.http.routers.gvmd.tls.certresolver=le"
+      - "traefik.http.services.gvmd.loadbalancer.server.port=${GVM_PORT:-9392}"
+    volumes:
+      - gvm-data:/var/lib/gvm
+      - gvm-log:/var/log/gvm
+    depends_on:
+      - openvasd
+      - ospd
+    networks:
+      - web
+
+  ospd:
+    image: greenbone/ospd-openvas:stable
+    volumes:
+      - gvm-data:/var/lib/gvm
+      - openvas-data:/var/lib/openvas
+      - notus:/var/lib/notus
+
+  openvasd:
+    image: greenbone/openvasd:stable
+    volumes:
+      - notus:/var/lib/notus
+
+networks:
+  web:
+    external: false
+
+volumes:
+  gvm-data: {}
+  gvm-log: {}
+  openvas-data: {}
+  notus: {}
+  traefik_letsencrypt: {}

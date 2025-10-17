@@ -1,0 +1,38 @@
+version: "3.9"
+services:
+  gvmd:
+    image: greenbone/gvmd:stable
+    container_name: gvmd
+    env_file: .env
+    volumes:
+      - gvm-data:/var/lib/gvm
+      - gvm-log:/var/log/gvm
+    ports:
+      - "${GVM_PORT:-9392}:${GVM_PORT:-9392}"
+    depends_on:
+      - openvasd
+      - ospd
+  ospd:
+    image: greenbone/ospd-openvas:stable
+    container_name: ospd-openvas
+    volumes:
+      - gvm-data:/var/lib/gvm
+      - openvas-data:/var/lib/openvas
+      - notus:/var/lib/notus
+  openvasd:
+    image: greenbone/openvasd:stable
+    container_name: openvasd
+    volumes:
+      - notus:/var/lib/notus
+  feed-sync:
+    image: greenbone/greenbone-feed-sync:stable
+    container_name: greenbone-feed-sync
+    volumes:
+      - gvm-data:/var/lib/gvm
+      - openvas-data:/var/lib/openvas
+      - notus:/var/lib/notus
+volumes:
+  gvm-data: {}
+  gvm-log: {}
+  openvas-data: {}
+  notus: {}
